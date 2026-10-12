@@ -49,6 +49,12 @@ const MOVING_GUIDE_RADIUS_MM = 4;
 const TRACKING_TOLERANCE_MM = 5;
 const TRACKING_EVAL_INTERVAL_MS = 5;
 
+// 運動終了をペン離脱と分けるための暫定基準。予備実験後に再調整する。
+const MOVEMENT_OFFSET_SPEED_THRESHOLD_MM_S = 10;
+const MOVEMENT_OFFSET_SUSTAIN_MS = 50;
+const MOVEMENT_OFFSET_SMOOTHING_MS = 20;
+const MOVEMENT_OFFSET_MIN_PROGRESS = 0.8;
+
 // canvas 内の大きなデジタルタイマー(視覚メトロノーム)の表示位置(canvasサイズ比)。
 // 線分や始点・終点と重なる場合に調整しやすいよう定数化している。
 const VISUAL_TIMER_X_RATIO = 0.18;
@@ -103,14 +109,18 @@ const RAW_COLUMNS = [
   'session_id', 'participant_id', 'phase', 'sync_role',
   'block_index', 'trial_index', 'trial_global_index', 'repetition_index',
   'target_angle_deg', 'event_type', 'pointer_type', 'pointer_id', 'tap_index',
-  'timestamp_ms', 'epoch_ms', 'iso_time', 'x_mm', 'y_mm', 'pressure',
+  'timestamp_ms', 'epoch_ms', 'iso_time',
+  'handler_timestamp_ms', 'event_processing_delay_ms', 'event_timestamp_source',
+  'coalesced_batch_size', 'coalesced_event_index',
+  'x_mm', 'y_mm', 'pressure',
   'target_pressure', 'pressure_tolerance', 'pressure_low', 'pressure_high',
   'target_duration_ms', 'target_line_length_mm', 'pre_trial_sync_wait_ms',
   'trial_start_button_time_ms', 'countdown_go_time_ms', 'first_pointerdown_time_ms',
   'last_pointerup_time_ms', 'trial_end_time_ms',
   'canvas_width_mm', 'canvas_height_mm', 'device_pixel_ratio',
   // 自己ペース開始方式で追加(既存列の後ろに追加)
-  'touch_start_time_ms', 'movement_onset_time_ms',
+  'touch_start_time_ms', 'movement_onset_time_ms', 'movement_onset_reference',
+  'movement_offset_time_ms', 'movement_offset_method',
   // EMG最大随意収縮(MVC)キャリブレーション用(既存列の後ろに追加)
   'mvc_direction',
   // 試行前同期タップ終了〜結果ボタン押下を1 attemptとして識別する
@@ -158,6 +168,14 @@ const SUMMARY_COLUMNS = [
   'mean_abs_along_track_error_mm', 'mean_abs_cross_track_error_mm',
   'goal_arrival_time_ms', 'goal_arrival_elapsed_ms', 'release_time_error_ms',
   'tracking_ok',
+  // 接触・実移動・ペン離脱を分けた時間指標
+  'movement_offset_time_ms', 'kinematic_duration_ms', 'start_delay_ms',
+  'dwell_after_movement_ms', 'goal_dwell_ms', 'movement_offset_method',
+  'emg_touch_window_start_candidate_ms', 'emg_movement_window_start_candidate_ms',
+  // Pointer Event時刻の品質確認
+  'pointer_event_count', 'median_pointer_interval_ms', 'p95_pointer_interval_ms',
+  'max_pointer_interval_ms', 'estimated_pointer_rate_hz', 'median_event_processing_delay_ms',
+  'p95_event_processing_delay_ms', 'coalesced_event_ratio',
 ];
 
 /* ===================================================================
@@ -168,6 +186,7 @@ const appState = {
   screen: 'settings',          // 現在の画面
   mode: 'idle',                // pointer 処理のルーティング用: idle/calibration/sync/trial
   sessionStartPerformanceNow: 0, // timestamp_ms の基準 (performance.now())
+  sessionStartEpochMs: 0,
 
   settings: null,              // 確定した設定
   session_id: '',
@@ -357,6 +376,11 @@ function makeBaseRow(partial) {
     timestamp_ms: '',
     epoch_ms: '',
     iso_time: '',
+    handler_timestamp_ms: '',
+    event_processing_delay_ms: '',
+    event_timestamp_source: '',
+    coalesced_batch_size: '',
+    coalesced_event_index: '',
     // x_px/y_pxはブラウザ内の描画・補間専用。CSVにはmm列だけを書き出す。
     x_px: '',
     y_px: '',
@@ -377,6 +401,9 @@ function makeBaseRow(partial) {
     trial_end_time_ms: '',
     touch_start_time_ms: '',
     movement_onset_time_ms: '',
+    movement_onset_reference: '',
+    movement_offset_time_ms: '',
+    movement_offset_method: '',
     mvc_direction: '',
     attempt_index: '',
     attempt_id: '',
@@ -415,18 +442,67 @@ function pushRaw(partial) {
 }
 
 // pointer event から座標/筆圧/時刻を抽出した raw 行 partial を作る
-function eventToRowFields(ev, eventTypeOverride) {
+// PointerEvent.timeStampをperformance.now()と同じ時間軸へ正規化する。
+// 一部環境でUnix時刻形式が返る場合も吸収し、異常値は処理時刻へフォールバックする。
+function normalizedPointerEventTime(ev, handlerPerformanceNow) {
+  const raw = Number(ev && ev.timeStamp);
+  const sessionDerivedOrigin = Number(appState.sessionStartEpochMs) - Number(appState.sessionStartPerformanceNow);
+  const timeOrigin = Number(performance.timeOrigin) ||
+    (Number.isFinite(sessionDerivedOrigin) && appState.sessionStartEpochMs ? sessionDerivedOrigin : Date.now() - handlerPerformanceNow);
+  if (!Number.isFinite(raw) || raw <= 0) {
+    return {
+      performance_ms: handlerPerformanceNow,
+      epoch_ms: timeOrigin + handlerPerformanceNow,
+      source: 'handler_fallback',
+    };
+  }
+
+  let eventPerformanceMs = raw;
+  let eventEpochMs = timeOrigin + raw;
+  let source = 'pointer_event_timestamp';
+  if (raw > 1e12) {
+    eventEpochMs = raw;
+    eventPerformanceMs = raw - timeOrigin;
+    source = 'pointer_event_epoch_timestamp';
+  }
+
+  // 異なる時間原点や壊れた値を誤って採用しない。
+  if (!Number.isFinite(eventPerformanceMs) || Math.abs(eventPerformanceMs - handlerPerformanceNow) > 86400000) {
+    return {
+      performance_ms: handlerPerformanceNow,
+      epoch_ms: timeOrigin + handlerPerformanceNow,
+      source: 'handler_fallback',
+    };
+  }
+  return { performance_ms: eventPerformanceMs, epoch_ms: eventEpochMs, source };
+}
+
+function eventToRowFields(ev, eventTypeOverride, timingMeta = {}) {
   const rect = appState.canvas.getBoundingClientRect();
   // 座標は canvas 左上基準に変換して保存する
   const x = ev.clientX - rect.left;
   const y = ev.clientY - rect.top;
+  const handlerPerformanceNow = Number.isFinite(Number(timingMeta.handlerPerformanceNow))
+    ? Number(timingMeta.handlerPerformanceNow) : performance.now();
+  const handlerTimestampMs = handlerPerformanceNow - appState.sessionStartPerformanceNow;
+  const eventTime = normalizedPointerEventTime(ev, handlerPerformanceNow);
+  const eventTimestampMs = eventTime.performance_ms - appState.sessionStartPerformanceNow;
+  const batchSize = Number.isFinite(Number(timingMeta.coalescedBatchSize))
+    ? Number(timingMeta.coalescedBatchSize) : 1;
+  const batchIndex = Number.isFinite(Number(timingMeta.coalescedEventIndex))
+    ? Number(timingMeta.coalescedEventIndex) : 0;
   return {
     event_type: eventTypeOverride || ev.type,
     pointer_type: ev.pointerType || '',
     pointer_id: ev.pointerId !== undefined ? ev.pointerId : '',
-    timestamp_ms: round(nowMs(), 3),
-    epoch_ms: Date.now(),
-    iso_time: new Date().toISOString(),
+    timestamp_ms: round(eventTimestampMs, 3),
+    epoch_ms: round(eventTime.epoch_ms, 3),
+    iso_time: new Date(eventTime.epoch_ms).toISOString(),
+    handler_timestamp_ms: round(handlerTimestampMs, 3),
+    event_processing_delay_ms: round(handlerTimestampMs - eventTimestampMs, 3),
+    event_timestamp_source: eventTime.source,
+    coalesced_batch_size: batchSize,
+    coalesced_event_index: batchIndex,
     x_px: round(x, 2),
     y_px: round(y, 2),
     x_mm: round(cssPxToMmX(x), 3),
@@ -1087,11 +1163,16 @@ function recordAttemptPointerEvents(ev, eventType) {
     const coalesced = ev.getCoalescedEvents();
     if (coalesced && coalesced.length > 0) events = coalesced;
   }
-  for (const event of events) {
-    pushAttemptRaw(Object.assign(eventToRowFields(event, eventType), trialTagFields(), {
+  const handlerPerformanceNow = performance.now();
+  events.forEach((event, index) => {
+    pushAttemptRaw(Object.assign(eventToRowFields(event, eventType, {
+      handlerPerformanceNow,
+      coalescedBatchSize: events.length,
+      coalescedEventIndex: index,
+    }), trialTagFields(), {
       phase: 'trial_window',
     }));
-  }
+  });
 }
 
 function onPointerDown(ev) {
@@ -1292,8 +1373,8 @@ function enterPracticeIntro() {
   setCenter('練習', '速度ガイドと筆圧ガイドを大きく表示して練習できます', '');
   setControls([
     { label: '練習開始', onClick: () => startPracticeTrial() },
-    { label: '練習をスキップ', secondary: true, onClick: () => enterStartSync() },
-    { label: '本番へ進む', secondary: true, onClick: () => enterStartSync() },
+    { label: '練習をスキップ', secondary: true, onClick: () => startMainExperiment() },
+    { label: '本番へ進む', secondary: true, onClick: () => startMainExperiment() },
   ]);
   practice.remaining = NUM_PRACTICE_TRIALS;
 }
@@ -1320,13 +1401,13 @@ function afterPracticeTrial() {
     setCenter('練習', `残り ${practice.remaining} 本。続けますか？`, '');
     setControls([
       { label: 'もう一度練習', onClick: () => startPracticeTrial() },
-      { label: '本番へ進む', secondary: true, onClick: () => enterStartSync() },
+      { label: '本番へ進む', secondary: true, onClick: () => startMainExperiment() },
     ]);
   } else {
     setCenter('練習終了', '本番へ進んでください', '');
     setControls([
       { label: 'もう一度練習', secondary: true, onClick: () => { practice.remaining = 1; startPracticeTrial(); } },
-      { label: '本番へ進む', onClick: () => enterStartSync() },
+      { label: '本番へ進む', onClick: () => startMainExperiment() },
     ]);
   }
 }
@@ -1353,8 +1434,8 @@ function enterStartSync() {
     role: 'start_sync_tap',
     needed: 3,
     title: '開始前同期タップ',
-    instruction: 'PicoLogの記録を開始した後、画面中央をペンで強く3回タップしてください',
-    onComplete: () => startMainExperiment(),
+    instruction: 'PicoLogとMediaPipeの記録を開始した後、画面中央をペンで強く3回タップしてください',
+    onComplete: () => enterBaselineProtocol(),
   });
 }
 
@@ -1485,7 +1566,7 @@ function showBaselineConditionIntro() {
   updateTopInfo(null, '安静時ベースライン');
   setHud({ top: true, pressure: false, bottom: false, center: true, controls: true, summary: false });
   const firstNote = baseline.conditionIndex === 0
-    ? '先にPicoLogとMediaPipeの記録を開始してください。 '
+    ? 'PicoLogとMediaPipeの記録を継続してください。 '
     : '';
   setCenter(
     `安静時計測 ${condition.id} / ${BASELINE_CONDITIONS.length}：${condition.label}`,
@@ -1955,6 +2036,10 @@ function newTrialCtx(trial, phase) {
     started: false,                 // 始点タッチ済み(trial記録開始済み)
     touch_start_time_ms: '',        // 始点タッチ時刻(実質運筆開始)
     movement_onset_time_ms: null,   // 始点から閾値以上動いた最初の時刻
+    movement_offset_time_ms: null,
+    movement_offset_method: '',
+    kinematicTiming: null,
+    last_movement_sample: null,
     start_touch_x_px: '',
     start_touch_y_px: '',
     end_release_x_px: '',
@@ -2178,6 +2263,7 @@ function trialPointerDown(ev) {
     trialCtx.touch_start_time_ms = fields.timestamp_ms;
     trialCtx.start_touch_x_px = fields.x_px;
     trialCtx.start_touch_y_px = fields.y_px;
+    trialCtx.last_movement_sample = { timestamp_ms: fields.timestamp_ms, distance_mm: 0 };
     setCenter('', '', '');                     // 指示文を消す
     const row = pushAttemptRaw(Object.assign(fields, trialTagFields()), 'drawing'); // phase=trial
     trialCtx.rawRows.push(row);
@@ -2214,18 +2300,38 @@ function trialPointerMove(ev) {
     const co = ev.getCoalescedEvents();
     if (co && co.length > 0) events = co;
   }
-  const ideal = appState.currentLine;
-  for (const e of events) {
-    const row = pushAttemptRaw(Object.assign(eventToRowFields(e, 'pointermove'), trialTagFields()), 'drawing');
+  const handlerPerformanceNow = performance.now();
+  events.forEach((e, index) => {
+    const row = pushAttemptRaw(Object.assign(eventToRowFields(e, 'pointermove', {
+      handlerPerformanceNow,
+      coalescedBatchSize: events.length,
+      coalescedEventIndex: index,
+    }), trialTagFields()), 'drawing');
     trialCtx.rawRows.push(row);
-    // movement onset: 始点から MOVEMENT_ONSET_THRESHOLD_MM 以上離れた最初の時刻
-    if (trialCtx.movement_onset_time_ms === null && ideal) {
-      const d = distanceCssPxInMm(row.x_px, row.y_px, ideal.start.x, ideal.start.y);
+    // movement onset: 実際の最初の接触位置から閾値以上離れた最初の時刻
+    if (trialCtx.movement_onset_time_ms === null &&
+        Number.isFinite(Number(trialCtx.start_touch_x_px)) &&
+        Number.isFinite(Number(trialCtx.start_touch_y_px))) {
+      const d = distanceCssPxInMm(
+        trialCtx.start_touch_x_px, trialCtx.start_touch_y_px, row.x_px, row.y_px
+      );
       if (d >= MOVEMENT_ONSET_THRESHOLD_MM) {
-        trialCtx.movement_onset_time_ms = row.timestamp_ms;
+        // 閾値をまたぐ2点間を線形補間し、サンプル間の通過時刻を推定する。
+        const previous = trialCtx.last_movement_sample;
+        if (previous && previous.distance_mm < MOVEMENT_ONSET_THRESHOLD_MM && d > previous.distance_mm) {
+          const ratio = clamp(
+            (MOVEMENT_ONSET_THRESHOLD_MM - previous.distance_mm) / (d - previous.distance_mm), 0, 1
+          );
+          trialCtx.movement_onset_time_ms = round(
+            Number(previous.timestamp_ms) + (Number(row.timestamp_ms) - Number(previous.timestamp_ms)) * ratio, 3
+          );
+        } else {
+          trialCtx.movement_onset_time_ms = row.timestamp_ms;
+        }
       }
+      trialCtx.last_movement_sample = { timestamp_ms: row.timestamp_ms, distance_mm: d };
     }
-  }
+  });
 
   // --- 補助的なペン離れ検出(筆圧0が一定時間続いた場合) ---
   // Wacom では hover 中に pressure 0 の move が入ることがあるため、すぐ確定せず
@@ -2298,6 +2404,17 @@ function finalizeTrial() {
   }
   console.log('[finalizeTrial]', nowMs());
 
+  trialCtx.kinematicTiming = computeKinematicTiming(
+    trialCtx.rawRows,
+    appState.currentLine,
+    trialCtx.touch_start_time_ms,
+    trialCtx.movement_onset_time_ms,
+    trialCtx.last_pointerup_time_ms
+  );
+  trialCtx.movement_offset_time_ms = trialCtx.kinematicTiming.movement_offset_time_ms === ''
+    ? null : trialCtx.kinematicTiming.movement_offset_time_ms;
+  trialCtx.movement_offset_method = trialCtx.kinematicTiming.movement_offset_method;
+
   // タイミング列を、この試行の全 raw 行へバックフィルする
   backfillTrialTiming();
 
@@ -2328,11 +2445,178 @@ function backfillTrialTiming() {
     // 自己ペース開始方式の時刻を各 trial 行へバックフィル
     touch_start_time_ms: trialCtx.touch_start_time_ms,
     movement_onset_time_ms: trialCtx.movement_onset_time_ms === null ? '' : trialCtx.movement_onset_time_ms,
+    movement_onset_reference: 'actual_touch_point',
+    movement_offset_time_ms: trialCtx.movement_offset_time_ms === null ? '' : trialCtx.movement_offset_time_ms,
+    movement_offset_method: trialCtx.movement_offset_method,
   }, attemptFields);
   const all = trialCtx.phase === 'trial'
     ? trialCtx.attemptRows
     : trialCtx.preTrialSyncRows.concat(trialCtx.rawRows);
   for (const row of all) Object.assign(row, fields);
+}
+
+function percentile(values, ratio) {
+  const sorted = values.filter(Number.isFinite).slice().sort((a, b) => a - b);
+  if (!sorted.length) return '';
+  const index = clamp((sorted.length - 1) * ratio, 0, sorted.length - 1);
+  const lower = Math.floor(index), upper = Math.ceil(index);
+  if (lower === upper) return sorted[lower];
+  return sorted[lower] + (sorted[upper] - sorted[lower]) * (index - lower);
+}
+
+// 接触区間を補間し、終点到達・実移動終了・Pointer Event品質を計算する。
+// 運動終了基準は予備実験用であり、元のpointerup時刻も必ず併記する。
+function computeKinematicTiming(rows, line, touchStartMs, movementOnsetMs, lastPointerUpMs) {
+  const optionalNumber = (value) => (value === '' || value === null || value === undefined)
+    ? NaN : Number(value);
+  const touch = optionalNumber(touchStartMs);
+  const onset = optionalNumber(movementOnsetMs);
+  const release = optionalNumber(lastPointerUpMs);
+  const usable = rows
+    .filter((row) => Number.isFinite(Number(row.timestamp_ms)) &&
+      Number.isFinite(Number(row.x_px)) && Number.isFinite(Number(row.y_px)))
+    .map((row) => Object.assign({}, row, {
+      timestamp_ms: Number(row.timestamp_ms), x_px: Number(row.x_px), y_px: Number(row.y_px),
+    }))
+    .sort((a, b) => a.timestamp_ms - b.timestamp_ms);
+
+  const intervals = [];
+  for (let i = 1; i < usable.length; i++) {
+    const dt = usable[i].timestamp_ms - usable[i - 1].timestamp_ms;
+    if (dt > 0) intervals.push(dt);
+  }
+  const delays = usable
+    .map((row) => Number(row.event_processing_delay_ms))
+    .filter(Number.isFinite);
+  const coalescedCount = usable.filter((row) => Number(row.coalesced_batch_size) > 1).length;
+  const medianInterval = percentile(intervals, 0.5);
+  const quality = {
+    pointer_event_count: usable.length,
+    median_pointer_interval_ms: round(medianInterval, 3),
+    p95_pointer_interval_ms: round(percentile(intervals, 0.95), 3),
+    max_pointer_interval_ms: intervals.length ? round(Math.max(...intervals), 3) : '',
+    estimated_pointer_rate_hz: Number.isFinite(medianInterval) && medianInterval > 0
+      ? round(1000 / medianInterval, 2) : '',
+    median_event_processing_delay_ms: round(percentile(delays, 0.5), 3),
+    p95_event_processing_delay_ms: round(percentile(delays, 0.95), 3),
+    coalesced_event_ratio: usable.length ? round(coalescedCount / usable.length, 3) : '',
+  };
+
+  if (!line || !Number.isFinite(touch) || !Number.isFinite(release) || release <= touch || !usable.length) {
+    return Object.assign({
+      goal_arrival_time_ms: '', goal_arrival_elapsed_ms: '',
+      movement_offset_time_ms: '', movement_offset_method: '',
+      kinematic_duration_ms: '', start_delay_ms: '', dwell_after_movement_ms: '', goal_dwell_ms: '',
+    }, quality);
+  }
+
+  const strokes = [];
+  let stroke = null;
+  for (const row of usable) {
+    if (row.event_type === 'pointerdown') {
+      if (stroke && stroke.length) strokes.push(stroke);
+      stroke = [row];
+    } else if (stroke) {
+      stroke.push(row);
+      if (row.event_type === 'pointerup' || row.event_type === 'pointercancel') {
+        strokes.push(stroke);
+        stroke = null;
+      }
+    }
+  }
+  if (stroke && stroke.length) strokes.push(stroke);
+
+  function positionAt(timeMs) {
+    const active = strokes.find((candidate) =>
+      timeMs >= candidate[0].timestamp_ms && timeMs <= candidate[candidate.length - 1].timestamp_ms
+    );
+    if (!active) return null;
+    if (active.length === 1) return { x: active[0].x_px, y: active[0].y_px };
+    for (let i = 1; i < active.length; i++) {
+      const a = active[i - 1], b = active[i];
+      if (timeMs <= b.timestamp_ms) {
+        const dt = b.timestamp_ms - a.timestamp_ms;
+        const u = dt > 0 ? clamp((timeMs - a.timestamp_ms) / dt, 0, 1) : 1;
+        return { x: a.x_px + (b.x_px - a.x_px) * u, y: a.y_px + (b.y_px - a.y_px) * u };
+      }
+    }
+    const last = active[active.length - 1];
+    return { x: last.x_px, y: last.y_px };
+  }
+
+  const lineStartMm = pointPxToMm(line.start.x, line.start.y);
+  const lineEndMm = pointPxToMm(line.end.x, line.end.y);
+  const lineDx = lineEndMm.x - lineStartMm.x;
+  const lineDy = lineEndMm.y - lineStartMm.y;
+  const lineLength = Math.hypot(lineDx, lineDy) || 1;
+  const sampleStepMs = TRACKING_EVAL_INTERVAL_MS;
+  const sampleCount = Math.max(1, Math.ceil((release - touch) / sampleStepMs));
+  const samples = [];
+  let goalArrival = '';
+  for (let i = 0; i <= sampleCount; i++) {
+    const timeMs = Math.min(release, touch + i * sampleStepMs);
+    const position = positionAt(timeMs);
+    if (!position) {
+      samples.push({ time_ms: timeMs, position: null, progress: null, speed_mm_s: null });
+      continue;
+    }
+    const pointMm = pointPxToMm(position.x, position.y);
+    const progress = ((pointMm.x - lineStartMm.x) * lineDx + (pointMm.y - lineStartMm.y) * lineDy) /
+      (lineLength * lineLength);
+    if (goalArrival === '' && Math.hypot(pointMm.x - lineEndMm.x, pointMm.y - lineEndMm.y) <= TRACKING_TOLERANCE_MM) {
+      goalArrival = timeMs;
+    }
+    samples.push({ time_ms: timeMs, position, point_mm: pointMm, progress, speed_mm_s: null });
+  }
+
+  const smoothSteps = Math.max(1, Math.round(MOVEMENT_OFFSET_SMOOTHING_MS / sampleStepMs));
+  for (let i = smoothSteps; i < samples.length; i++) {
+    const current = samples[i], previous = samples[i - smoothSteps];
+    if (!current.point_mm || !previous.point_mm) continue;
+    const dtSec = (current.time_ms - previous.time_ms) / 1000;
+    if (dtSec <= 0) continue;
+    current.speed_mm_s = Math.hypot(
+      current.point_mm.x - previous.point_mm.x,
+      current.point_mm.y - previous.point_mm.y
+    ) / dtSec;
+  }
+
+  const sustainSteps = Math.max(1, Math.ceil(MOVEMENT_OFFSET_SUSTAIN_MS / sampleStepMs));
+  let movementOffset = release;
+  let offsetMethod = 'pointerup_fallback';
+  for (let i = smoothSteps; i + sustainSteps < samples.length; i++) {
+    const sample = samples[i];
+    if (sample.progress === null || sample.progress < MOVEMENT_OFFSET_MIN_PROGRESS) continue;
+    let sustained = true;
+    // 最後の低速区間だけを採用し、途中の一時停止後に再び動いた場合は開始点にしない。
+    for (let j = i; j < samples.length; j++) {
+      const speed = samples[j].speed_mm_s;
+      if (!Number.isFinite(speed) || speed >= MOVEMENT_OFFSET_SPEED_THRESHOLD_MM_S) {
+        sustained = false;
+        break;
+      }
+    }
+    if (sustained) {
+      movementOffset = Math.max(touch, sample.time_ms - MOVEMENT_OFFSET_SMOOTHING_MS);
+      offsetMethod = 'sustained_low_speed';
+      break;
+    }
+  }
+  if (Number.isFinite(onset) && movementOffset < onset) {
+    movementOffset = release;
+    offsetMethod = 'pointerup_fallback';
+  }
+
+  return Object.assign({
+    goal_arrival_time_ms: goalArrival === '' ? '' : round(goalArrival, 3),
+    goal_arrival_elapsed_ms: goalArrival === '' ? '' : round(goalArrival - touch, 3),
+    movement_offset_time_ms: round(movementOffset, 3),
+    movement_offset_method: offsetMethod,
+    kinematic_duration_ms: Number.isFinite(onset) ? round(movementOffset - onset, 3) : '',
+    start_delay_ms: Number.isFinite(onset) ? round(onset - touch, 3) : '',
+    dwell_after_movement_ms: round(release - movementOffset, 3),
+    goal_dwell_ms: goalArrival === '' ? '' : round(release - goalArrival, 3),
+  }, quality);
 }
 
 // Pointer Eventの間を線形補間し、一定時間刻みでガイド追従を評価する。
@@ -2542,6 +2826,10 @@ function computeSummary() {
   const tracking = computeTrackingMetrics(
     moves, ideal, trialCtx.touch_start_time_ms, s.target_duration_ms
   );
+  const kinematic = trialCtx.kinematicTiming || computeKinematicTiming(
+    moves, ideal, trialCtx.touch_start_time_ms, trialCtx.movement_onset_time_ms,
+    trialCtx.last_pointerup_time_ms
+  );
   const release_time_error_ms = actual_duration_ms === ''
     ? '' : actual_duration_ms - s.target_duration_ms;
 
@@ -2549,6 +2837,8 @@ function computeSummary() {
   let emg_start = '', emg_end = '';
   if (trialCtx.touch_start_time_ms !== '') emg_start = trialCtx.touch_start_time_ms - EMG_PRE_MARGIN_MS;
   if (trialCtx.last_pointerup_time_ms !== null) emg_end = trialCtx.last_pointerup_time_ms + EMG_POST_MARGIN_MS;
+  const emgMovementStart = trialCtx.movement_onset_time_ms === null
+    ? '' : trialCtx.movement_onset_time_ms - EMG_PRE_MARGIN_MS;
 
   // --- 成功 / やり直し候補 / 失敗 の判定(共通関数) ---
   const evalResult = evaluateTrialQuality({
@@ -2598,6 +2888,8 @@ function computeSummary() {
     trial_end_time_ms: trialCtx.trial_end_time_ms,
     emg_window_start_candidate_ms: round(emg_start, 2),
     emg_window_end_candidate_ms: round(emg_end, 2),
+    emg_touch_window_start_candidate_ms: round(emg_start, 2),
+    emg_movement_window_start_candidate_ms: round(emgMovementStart, 2),
     success_flag: success_flag,
     notes: evalResult.notes,
     // 追加の判定詳細列(既存列の後ろに追記)
@@ -2632,10 +2924,24 @@ function computeSummary() {
     tracking_observed_ratio: tracking.tracking_observed_ratio,
     mean_abs_along_track_error_mm: tracking.mean_abs_along_track_error_mm,
     mean_abs_cross_track_error_mm: tracking.mean_abs_cross_track_error_mm,
-    goal_arrival_time_ms: tracking.goal_arrival_time_ms,
-    goal_arrival_elapsed_ms: tracking.goal_arrival_elapsed_ms,
+    goal_arrival_time_ms: kinematic.goal_arrival_time_ms,
+    goal_arrival_elapsed_ms: kinematic.goal_arrival_elapsed_ms,
     release_time_error_ms: round(release_time_error_ms, 2),
     tracking_ok: evalResult.tracking_ok,
+    movement_offset_time_ms: kinematic.movement_offset_time_ms,
+    kinematic_duration_ms: kinematic.kinematic_duration_ms,
+    start_delay_ms: kinematic.start_delay_ms,
+    dwell_after_movement_ms: kinematic.dwell_after_movement_ms,
+    goal_dwell_ms: kinematic.goal_dwell_ms,
+    movement_offset_method: kinematic.movement_offset_method,
+    pointer_event_count: kinematic.pointer_event_count,
+    median_pointer_interval_ms: kinematic.median_pointer_interval_ms,
+    p95_pointer_interval_ms: kinematic.p95_pointer_interval_ms,
+    max_pointer_interval_ms: kinematic.max_pointer_interval_ms,
+    estimated_pointer_rate_hz: kinematic.estimated_pointer_rate_hz,
+    median_event_processing_delay_ms: kinematic.median_event_processing_delay_ms,
+    p95_event_processing_delay_ms: kinematic.p95_event_processing_delay_ms,
+    coalesced_event_ratio: kinematic.coalesced_event_ratio,
   };
   return summary;
 }
@@ -3007,12 +3313,21 @@ function buildSettingsJson() {
     spatial_schema_version: 'mm_v1',
     calibration_method: 'DTH134_display_dimensions_mapped_to_fullscreen_canvas',
     fullscreen_required_for_mm_accuracy: true,
-    movement_onset_reference: 'ideal_start',
+    pointer_timestamp_source: 'PointerEvent.timeStamp_with_handler_fallback',
+    pointer_timestamp_schema_version: 'event_time_v1',
+    session_start_performance_ms: round(appState.sessionStartPerformanceNow, 3),
+    session_start_epoch_ms: appState.sessionStartEpochMs,
+    movement_onset_reference: 'actual_touch_point',
     mm_per_css_px_x: round(mmPerCssPxX(), 8),
     mm_per_css_px_y: round(mmPerCssPxY(), 8),
     moving_guide_radius_mm: MOVING_GUIDE_RADIUS_MM,
     start_zone_radius_mm: START_ZONE_RADIUS_MM,
     movement_onset_threshold_mm: MOVEMENT_ONSET_THRESHOLD_MM,
+    movement_offset_method: 'smoothed_velocity_threshold_with_pointerup_fallback',
+    movement_offset_velocity_threshold_mm_s: MOVEMENT_OFFSET_SPEED_THRESHOLD_MM_S,
+    movement_offset_sustain_ms: MOVEMENT_OFFSET_SUSTAIN_MS,
+    movement_offset_smoothing_ms: MOVEMENT_OFFSET_SMOOTHING_MS,
+    movement_offset_min_progress: MOVEMENT_OFFSET_MIN_PROGRESS,
     tracking_tolerance_mm: TRACKING_TOLERANCE_MM,
     tracking_evaluation_interval_ms: TRACKING_EVAL_INTERVAL_MS,
     success_tracking_in_range_ratio_min: SUCCESS_CRITERIA.tracking_in_range_ratio_min,
@@ -3154,6 +3469,7 @@ function confirmSettings() {
 
   // セッション基準時刻と session_id を確定
   appState.sessionStartPerformanceNow = performance.now();
+  appState.sessionStartEpochMs = Date.now();
   appState.created_at_iso = new Date().toISOString();
   appState.session_id = `${s.participant_id}_${dateStamp(new Date())}`;
 
@@ -3178,14 +3494,14 @@ function confirmSettings() {
     console.warn('Canvas size is zero. Check panel visibility and resize timing.');
   }
 
-  let note = `設定確定。session_id=${appState.session_id} / 合計 ${appState.trialOrder.length} 試行。続いて安静時ベースライン計測へ。`;
+  let note = `設定確定。session_id=${appState.session_id} / 合計 ${appState.trialOrder.length} 試行。続いて開始前同期タップへ。`;
   if (s.target_line_length_mm > maxFit) {
     note += `\n警告: 線の長さ(${s.target_line_length_mm}mm)が画面サイズより大きい可能性があります(推奨 <= ${maxFit}mm)。`;
   }
   document.getElementById('settings-status').textContent = note;
 
-  // 安静時ベースライン → MVC → 筆圧キャリブレーション → 練習 の順に進む。
-  enterBaselineProtocol();
+  // 開始同期 → 安静時ベースライン → MVC → 筆圧キャリブレーション → 練習 の順に進む。
+  enterStartSync();
 }
 
 function requestFullscreen() {
