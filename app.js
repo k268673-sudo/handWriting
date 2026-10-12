@@ -135,6 +135,8 @@ const RAW_COLUMNS = [
   'baseline_id', 'baseline_type', 'baseline_stage',
   'baseline_target_duration_ms', 'baseline_guard_ms',
   'baseline_unexpected_contact_count', 'baseline_valid',
+  // 既存列の順序を保ったまま、運動開始定義をCSV単体で解釈できるよう追加
+  'movement_onset_threshold_mm',
 ];
 
 // summary CSV の列(順序固定)
@@ -176,6 +178,8 @@ const SUMMARY_COLUMNS = [
   'pointer_event_count', 'median_pointer_interval_ms', 'p95_pointer_interval_ms',
   'max_pointer_interval_ms', 'estimated_pointer_rate_hz', 'median_event_processing_delay_ms',
   'p95_event_processing_delay_ms', 'coalesced_event_ratio',
+  // 既存列の後ろに追加するタイミング定義
+  'contact_duration_ms', 'movement_onset_reference', 'movement_onset_threshold_mm',
 ];
 
 /* ===================================================================
@@ -402,6 +406,7 @@ function makeBaseRow(partial) {
     touch_start_time_ms: '',
     movement_onset_time_ms: '',
     movement_onset_reference: '',
+    movement_onset_threshold_mm: '',
     movement_offset_time_ms: '',
     movement_offset_method: '',
     mvc_direction: '',
@@ -2446,6 +2451,7 @@ function backfillTrialTiming() {
     touch_start_time_ms: trialCtx.touch_start_time_ms,
     movement_onset_time_ms: trialCtx.movement_onset_time_ms === null ? '' : trialCtx.movement_onset_time_ms,
     movement_onset_reference: 'actual_touch_point',
+    movement_onset_threshold_mm: MOVEMENT_ONSET_THRESHOLD_MM,
     movement_offset_time_ms: trialCtx.movement_offset_time_ms === null ? '' : trialCtx.movement_offset_time_ms,
     movement_offset_method: trialCtx.movement_offset_method,
   }, attemptFields);
@@ -2506,7 +2512,8 @@ function computeKinematicTiming(rows, line, touchStartMs, movementOnsetMs, lastP
     return Object.assign({
       goal_arrival_time_ms: '', goal_arrival_elapsed_ms: '',
       movement_offset_time_ms: '', movement_offset_method: '',
-      kinematic_duration_ms: '', start_delay_ms: '', dwell_after_movement_ms: '', goal_dwell_ms: '',
+      contact_duration_ms: '', kinematic_duration_ms: '', start_delay_ms: '',
+      dwell_after_movement_ms: '', goal_dwell_ms: '',
     }, quality);
   }
 
@@ -2612,6 +2619,7 @@ function computeKinematicTiming(rows, line, touchStartMs, movementOnsetMs, lastP
     goal_arrival_elapsed_ms: goalArrival === '' ? '' : round(goalArrival - touch, 3),
     movement_offset_time_ms: round(movementOffset, 3),
     movement_offset_method: offsetMethod,
+    contact_duration_ms: round(release - touch, 3),
     kinematic_duration_ms: Number.isFinite(onset) ? round(movementOffset - onset, 3) : '',
     start_delay_ms: Number.isFinite(onset) ? round(onset - touch, 3) : '',
     dwell_after_movement_ms: round(release - movementOffset, 3),
@@ -2929,11 +2937,14 @@ function computeSummary() {
     release_time_error_ms: round(release_time_error_ms, 2),
     tracking_ok: evalResult.tracking_ok,
     movement_offset_time_ms: kinematic.movement_offset_time_ms,
+    contact_duration_ms: kinematic.contact_duration_ms,
     kinematic_duration_ms: kinematic.kinematic_duration_ms,
     start_delay_ms: kinematic.start_delay_ms,
     dwell_after_movement_ms: kinematic.dwell_after_movement_ms,
     goal_dwell_ms: kinematic.goal_dwell_ms,
     movement_offset_method: kinematic.movement_offset_method,
+    movement_onset_reference: 'actual_touch_point',
+    movement_onset_threshold_mm: MOVEMENT_ONSET_THRESHOLD_MM,
     pointer_event_count: kinematic.pointer_event_count,
     median_pointer_interval_ms: kinematic.median_pointer_interval_ms,
     p95_pointer_interval_ms: kinematic.p95_pointer_interval_ms,
@@ -3313,7 +3324,8 @@ function buildSettingsJson() {
     spatial_schema_version: 'mm_v1',
     calibration_method: 'DTH134_display_dimensions_mapped_to_fullscreen_canvas',
     fullscreen_required_for_mm_accuracy: true,
-    pointer_timestamp_source: 'PointerEvent.timeStamp_with_handler_fallback',
+    pointer_timestamp_source: 'PointerEvent.timeStamp',
+    pointer_timestamp_fallback: 'performance.now()',
     pointer_timestamp_schema_version: 'event_time_v1',
     session_start_performance_ms: round(appState.sessionStartPerformanceNow, 3),
     session_start_epoch_ms: appState.sessionStartEpochMs,

@@ -198,7 +198,8 @@ PicoLog とアプリは**直接通信しません**。後処理で同期タッ�
   `result_display_time_ms`, `trial_window_end_time_ms`, `trial_window_end_epoch_ms`
 - ガイド追従: `guide_progress`, `guide_x_mm`, `guide_y_mm`, `tracking_error_mm`,
   `along_track_error_mm`, `cross_track_error_mm`
-- 運動境界: `movement_onset_reference`, `movement_offset_time_ms`, `movement_offset_method`
+- 運動境界: `movement_onset_reference`, `movement_onset_threshold_mm`,
+  `movement_offset_time_ms`, `movement_offset_method`
 - 安静時: `baseline_id`, `baseline_type`, `baseline_stage`, `baseline_target_duration_ms`,
   `baseline_guard_ms`, `baseline_unexpected_contact_count`, `baseline_valid`
 - 環境: `canvas_width_mm`, `canvas_height_mm`, `device_pixel_ratio`
@@ -227,7 +228,8 @@ PicoLog とアプリは**直接通信しません**。後処理で同期タッ�
   `tracking_in_range_ratio`, `tracking_observed_ratio`, `mean_abs_along_track_error_mm`,
   `mean_abs_cross_track_error_mm`, `goal_arrival_time_ms`, `goal_arrival_elapsed_ms`,
   `release_time_error_ms`, `tracking_ok`
-- 接触・実移動: `movement_offset_time_ms`, `kinematic_duration_ms`, `start_delay_ms`,
+- 接触・実移動: `contact_duration_ms`, `movement_onset_reference`,
+  `movement_onset_threshold_mm`, `movement_offset_time_ms`, `kinematic_duration_ms`, `start_delay_ms`,
   `dwell_after_movement_ms`, `goal_dwell_ms`, `movement_offset_method`
 - 時刻品質: `pointer_event_count`, `median_pointer_interval_ms`, `p95_pointer_interval_ms`,
   `max_pointer_interval_ms`, `estimated_pointer_rate_hz`, `median_event_processing_delay_ms`,
@@ -241,6 +243,7 @@ PicoLog とアプリは**直接通信しません**。後処理で同期タッ�
   （始点タッチ位置 → 終点リリース位置）
 - `angle_error_deg = |normalize180(target_angle_deg - actual_angle_deg)|`
 - `actual_duration_ms = last_pointerup_time_ms - touch_start_time_ms`
+- `contact_duration_ms = last_pointerup_time_ms - touch_start_time_ms`（定義を明示する追加列）
 - `movement_duration_ms = last_pointerup_time_ms - movement_onset_time_ms`
 - `kinematic_duration_ms = movement_offset_time_ms - movement_onset_time_ms`
 - `start_delay_ms = movement_onset_time_ms - touch_start_time_ms`
@@ -254,6 +257,10 @@ PicoLog とアプリは**直接通信しません**。後処理で同期タッ�
 - `tracking_rmse_mm` は接触中に観測できた評価時点のガイド・ペン間距離のRMSE
 - `emg_window_start_candidate_ms = touch_start_time_ms - 200`
 - `emg_window_end_candidate_ms = last_pointerup_time_ms + 200`
+
+`synced_trial_windows.csv` は既存列に加え、`emg_pointerup_sec`,
+`emg_touch_pre_start_sec`, `emg_movement_pre_start_sec` を出力します。
+これにより、接触基準と実運動基準のどちらでもEMG解析窓を選択できます。
 
 上記の運筆系指標はすべて `phase=trial`（始点タッチ以降）のデータのみで計算します。
 同期タップや `pre_start_touch` は含めません。
