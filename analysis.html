@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>EMG・運筆 統合解析ビューア</title>
+  <link rel="stylesheet" href="analysis.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <h1>EMG・運筆 統合解析ビューア</h1>
+      <p>筋電図前処理・%MVC正規化・課題別筋使用率・統計解析</p>
+    </div>
+    <a class="link-button" href="./index.html">実験アプリに戻る</a>
+  </header>
+
+  <main class="container">
+    <section class="card">
+      <h2>データ入力</h2>
+      <p class="muted">
+        既定値では `test` フォルダのデータを読み込みます。必要ならファイル選択で差し替えてください。
+      </p>
+      <div class="grid controls">
+        <label>EMG CSV
+          <input id="emg-file" type="file" accept=".csv" />
+        </label>
+        <label>Wacom summary CSV
+          <input id="summary-file" type="file" accept=".csv" />
+        </label>
+        <label>Wacom raw CSV
+          <input id="raw-file" type="file" accept=".csv" />
+        </label>
+        <label>時刻オフセット [秒]（EMG側へ加算）
+          <input id="offset-sec" type="number" step="0.1" value="0" />
+        </label>
+        <label>フォルダ一括入力（複数参加者/複数セッション）
+          <input id="folder-input" type="file" webkitdirectory directory multiple />
+        </label>
+      </div>
+      <div class="row">
+        <button id="btn-load-default">testデータを読み込む</button>
+        <button id="btn-load-folder">フォルダを読み込む</button>
+        <button id="btn-analyze">解析を実行</button>
+        <button id="btn-auto-offset">同期オフセット自動推定</button>
+        <button id="btn-export-results">結果ファイルを出力</button>
+      </div>
+      <p id="status" class="status">待機中</p>
+    </section>
+
+    <section class="card">
+      <h2>前処理パイプライン</h2>
+      <ol>
+        <li>外れ値抑制（1–99パーセンタイルでWinsorize）</li>
+        <li>DC成分除去（移動平均差分による高域強調）</li>
+        <li>全波整流</li>
+        <li>平滑化（移動平均ローパス）</li>
+        <li>RMS算出（スライディング窓）</li>
+        <li>%MVC化（MVC区間最大RMS基準、fallback: 95パーセンタイル）</li>
+      </ol>
+      <p class="muted">注: EMGが1秒集計データのため、厳密なアナログ帯域通過ではなく離散的な疑似バンドパスです。</p>
+    </section>
+
+    <section class="grid two">
+      <div class="card">
+        <h2>解析サマリー</h2>
+        <div id="summary-cards" class="summary-cards"></div>
+      </div>
+      <div class="card">
+        <h2>筋別 全体平均 %MVC</h2>
+        <div id="overall-muscle-bars"></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>時系列（%MVC）</h2>
+      <canvas id="timeseries-canvas" width="1200" height="280"></canvas>
+      <p class="muted">4筋の平滑化後RMS-%MVC。灰色背景は試行候補区間（summaryのEMG窓）です。</p>
+    </section>
+
+    <section class="card">
+      <h2>課題（角度）ごとの筋使用割合（4筋の比率）</h2>
+      <div id="angle-stacked-chart" class="scroll-x"></div>
+    </section>
+
+    <section class="card">
+      <h2>課題別 詳細</h2>
+      <div class="row">
+        <label>角度を選択
+          <select id="angle-select"></select>
+        </label>
+      </div>
+      <div id="angle-detail"></div>
+    </section>
+
+    <section class="card">
+      <h2>斜線は縦+横の合成か？（n,m推定）</h2>
+      <p class="muted">
+        各斜線角度に対して、4筋ベクトルを目的変数とし、対応する縦線・横線の4筋ベクトルの線形結合
+        `y = n * vertical + m * horizontal` を最小二乗で推定します。
+        R²が高いほど「縦横合成で説明可能」、低いほど「斜線固有の独立成分が強い」解釈です。
+      </p>
+      <div id="diagonal-model-summary" class="summary-cards"></div>
+      <div id="diagonal-model-table" class="scroll-x"></div>
+    </section>
+
+    <section class="card">
+      <h2>統計</h2>
+      <div id="stats-table"></div>
+      <p class="muted">
+        指標: 課題角度(24水準)を要因とした一元配置ANOVAのF値・効果量η²、
+        および置換検定（500回）による近似p値。
+      </p>
+    </section>
+  </main>
+
+  <script src="analysis.js"></script>
+</body>
+</html>

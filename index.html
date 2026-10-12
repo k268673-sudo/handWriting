@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Wacom 直線運筆 実験アプリ</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- ============================================================= -->
+  <!-- アプリ全体は単一ページ。screen ごとに panel を出し分けする。   -->
+  <!-- 描画系（キャリブ／同期／試行）は共通の #stage canvas を使う。  -->
+  <!-- ============================================================= -->
+
+  <!-- 4-1. 設定画面 -->
+  <section id="panel-settings" class="panel active">
+    <div class="settings-card">
+      <h1>Wacom 直線運筆 実験アプリ</h1>
+      <p class="subtitle">Wacom One 13 touch（DTH134）を接続し、ChromeまたはSafariをフルスクリーンにして実験を開始します。</p>
+
+      <div class="form-grid">
+        <label>参加者ID (participant_id)
+          <input type="text" id="set-participant_id" value="P01" />
+        </label>
+        <label>目標運筆時間 ms (target_duration_ms)
+          <input type="number" id="set-target_duration_ms" value="1000" min="100" step="50" />
+        </label>
+        <label>目標線長 mm (target_line_length_mm)
+          <input type="number" id="set-target_line_length_mm" value="50" min="10" step="1" />
+        </label>
+        <label>各方向の繰り返し回数 (repetitions_per_direction)
+          <input type="number" id="set-repetitions_per_direction" value="10" min="1" step="1" />
+        </label>
+        <label>筆圧許容範囲 (pressure_tolerance)
+          <input type="number" id="set-pressure_tolerance" value="0.08" min="0.01" max="1" step="0.01" />
+        </label>
+        <label>休憩を入れる試行数 (rest_every_trials)
+          <input type="number" id="set-rest_every_trials" value="24" min="1" step="1" />
+        </label>
+        <label>試行前同期タップ後の待機 ms (pre_trial_sync_wait_ms)
+          <input type="number" id="set-pre_trial_sync_wait_ms" value="1500" min="0" step="100" />
+        </label>
+        <label>安静条件ごとの計測時間 ms (baseline_duration_ms)
+          <input type="number" id="set-baseline_duration_ms" value="30000" min="20000" step="1000" />
+        </label>
+        <label>安静区間の前後除外時間 ms (baseline_guard_ms)
+          <input type="number" id="set-baseline_guard_ms" value="5000" min="1000" step="1000" />
+        </label>
+      </div>
+
+      <p class="status-text">固定条件：始点許容半径 5 mm ／ 追従許容距離 5 mm ／ ガイドリング半径 4 mm ／ 運動開始閾値 1 mm</p>
+
+      <div class="button-row">
+        <button id="btn-confirm-settings" class="btn">実験設定を確定</button>
+        <button id="btn-fullscreen" class="btn btn-secondary">フルスクリーン開始</button>
+      </div>
+      <p id="settings-status" class="status-text"></p>
+    </div>
+  </section>
+
+  <!-- 共通描画ステージ：キャリブ／同期／試行で使う -->
+  <section id="panel-stage" class="panel">
+    <canvas id="stage"></canvas>
+
+    <!-- 上部の試行情報 HUD -->
+    <div id="hud-top" class="hud hud-top hidden">
+      <span id="hud-timer" class="hud-timer"></span>
+      <span id="hud-pid"></span>
+      <span id="hud-trial"></span>
+      <span id="hud-block"></span>
+      <span id="hud-rep"></span>
+      <span id="hud-angle"></span>
+      <span id="hud-phase" class="hud-phase-badge"></span>
+    </div>
+
+    <!-- 右側の筆圧バー HUD -->
+    <div id="hud-pressure" class="hud hud-pressure hidden">
+      <div class="pressure-label">筆圧</div>
+      <div class="pressure-track">
+        <div id="pressure-band" class="pressure-band"></div>
+        <div id="pressure-target-line" class="pressure-target-line"></div>
+        <div id="pressure-fill" class="pressure-fill"></div>
+      </div>
+      <div class="pressure-values">
+        <div>現在: <span id="pressure-current">0.000</span></div>
+        <div>目標: <span id="pressure-target">-</span></div>
+        <div>範囲: <span id="pressure-range">-</span></div>
+      </div>
+    </div>
+
+    <!-- 下部の手首・前腕ガイド HUD -->
+    <div id="hud-bottom" class="hud hud-bottom hidden">
+      手首をこの線付近に合わせてください（前腕方向の目安）
+    </div>
+
+    <!-- 中央メッセージ（指示文・カウントダウン・タップ数） HUD -->
+    <div id="hud-center" class="hud hud-center hidden">
+      <div id="hud-center-text" class="hud-center-text"></div>
+      <div id="hud-center-sub" class="hud-center-sub"></div>
+      <div id="hud-center-count" class="hud-center-count"></div>
+    </div>
+
+    <!-- 下部の操作ボタン群（キャリブ・練習・同期の制御） -->
+    <div id="hud-controls" class="hud hud-controls hidden"></div>
+
+    <!-- 試行サマリーのフィードバック -->
+    <div id="hud-summary" class="hud hud-summary hidden">
+      <h2 id="summary-verdict"></h2>
+      <div id="summary-body" class="summary-body"></div>
+      <div class="button-row">
+        <button id="btn-summary-next" class="btn">次の試行</button>
+        <button id="btn-summary-redo" class="btn btn-secondary">やり直し</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4-9. 休憩画面 -->
+  <section id="panel-rest" class="panel">
+    <div class="settings-card center-card">
+      <h1>休憩してください</h1>
+      <p id="rest-progress" class="status-text"></p>
+      <div class="button-row">
+        <button id="btn-rest-resume" class="btn">再開</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4-11. データ保存画面 -->
+  <section id="panel-save" class="panel">
+    <div class="settings-card center-card">
+      <h1>実験終了：データ保存</h1>
+      <p class="status-text">まず「すべて保存」で raw CSV・summary CSV・settings JSON を含む ZIP を保存してください。</p>
+      <div class="button-row wrap">
+        <button id="btn-save-raw" class="btn" disabled>raw CSVを保存</button>
+        <button id="btn-save-summary" class="btn" disabled>summary CSVを保存</button>
+        <button id="btn-save-settings" class="btn" disabled>settings JSONを保存</button>
+        <button id="btn-save-all" class="btn btn-secondary">すべて保存</button>
+      </div>
+      <label class="save-confirm">
+        <input type="checkbox" id="save-confirmed" disabled />
+        ZIPファイルが保存先にあることを確認しました
+      </label>
+      <div class="button-row">
+        <button id="btn-back-to-settings" class="btn btn-secondary" disabled>設定に戻る（新しい実験）</button>
+      </div>
+      <p id="save-status" class="status-text"></p>
+    </div>
+  </section>
+
+  <script src="app.js"></script>
+</body>
+</html>
